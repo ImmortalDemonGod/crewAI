@@ -470,6 +470,50 @@ class LockedDictProxy(dict, Generic[T]):  # type: ignore[type-arg]
         return not self.__eq__(other)
 
 
+class LockedModelProxy:
+    """Lock-guarded proxy for a nested Pydantic ``BaseModel`` held in flow state.
+
+    ``StateProxy`` wraps ``list`` and ``dict`` attributes so that mutations on
+    nested containers acquire the flow state lock. Pydantic ``BaseModel``
+    instances were previously returned unwrapped (the ``return value`` fall
+    through), so ``flow.state.profile.name = "x"`` mutated the model attribute
+    entirely outside the lock. When parallel listeners mutate nested-model
+    attributes, those writes race and corrupt state silently. This proxy closes
+    that gap by routing every attribute read/write on the wrapped model through
+    the same lock, recursively wrapping nested lists, dicts, and models.
+    """
+
+    __slots__ = ("_lock", "_model")
+
+    def __init__(self, model: BaseModel, lock: threading.Lock) -> None:
+        object.__setattr__(self, "_model", model)
+        object.__setattr__(self, "_lock", lock)
+
+    def __getattr__(self, name: str) -> Any:
+        lock = object.__getattribute__(self, "_lock")
+        model = object.__getattribute__(self, "_model")
+        with lock:
+            value = getattr(model, name)
+
+        if isinstance(value, list):
+            return LockedListProxy(value, lock)
+        if isinstance(value, dict):
+            return LockedDictProxy(value, lock)
+        if isinstance(value, BaseModel):
+            return LockedModelProxy(value, lock)
+        return value
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in ("_model", "_lock"):
+            object.__setattr__(self, name, value)
+            return
+
+        lock = object.__getattribute__(self, "_lock")
+        model = object.__getattribute__(self, "_model")
+        with lock:
+            setattr(model, name, value)
+
+
 class StateProxy(Generic[T]):
     """Proxy that provides thread-safe access to flow state.
 
@@ -490,6 +534,8 @@ class StateProxy(Generic[T]):
             return LockedListProxy(value, lock)
         if isinstance(value, dict):
             return LockedDictProxy(value, lock)
+        if isinstance(value, BaseModel):
+            return LockedModelProxy(value, lock)
         return value
 
     def __setattr__(self, name: str, value: Any) -> None:

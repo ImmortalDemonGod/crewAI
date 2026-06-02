@@ -420,6 +420,40 @@ def test_flow_uuid_structured():
     assert flow.state.message == "final"
 
 
+def test_flow_state_proxy_wraps_nested_pydantic_models():
+    """Semantic-negative test for the nested-BaseModel locking gap.
+
+    ``StateProxy`` only wrapped ``list`` and ``dict`` attributes; nested Pydantic
+    models fell through unwrapped, so attribute writes on them bypassed the flow
+    state lock and could race under parallel listeners. With the
+    ``LockedModelProxy`` fix, ``flow.state.profile`` is a lock-guarded proxy
+    (distinct from the raw model and exposing ``_lock``), and mutations route
+    through the lock. Before the fix, ``profile is not self._state.profile`` and
+    ``hasattr(profile, "_lock")`` are both False and this test fails.
+    """
+
+    class UserProfile(BaseModel):
+        counter: int = 0
+
+    class MyStructuredState(BaseModel):
+        profile: UserProfile = UserProfile()
+
+    class NestedModelFlow(Flow[MyStructuredState]):
+        @start()
+        def first_method(self):
+            profile = self.state.profile
+            # The proxy must wrap the nested model, not return it raw.
+            assert profile is not self._state.profile
+            assert hasattr(profile, "_lock")
+
+            # Lock-guarded mutation is reflected on the underlying model.
+            profile.counter += 1
+            assert self.state.profile.counter == 1
+
+    flow = NestedModelFlow()
+    flow.kickoff()
+
+
 def test_router_with_multiple_conditions():
     """Test a router that triggers when any of multiple steps complete (OR condition),
     and another router that triggers only after all specified steps complete (AND condition).
